@@ -1,0 +1,407 @@
+-- Declare variables
+
+/*
+DECLARE @nCancerTableName NVARCHAR(100)
+DECLARE @nCancerType NVARCHAR(100)
+SET @nCancerTableName = 'SEER.dbo.SEER_lungcancer'
+SET @nCancerType = 'Lung'
+*/
+
+ALTER PROCEDURE [dbo].[SEERAttrition] 
+	@nCancerTableName NVARCHAR(100),
+	@nCancerType NVARCHAR(100)
+AS 
+
+
+DECLARE @nSQL NVARCHAR(MAX)
+DECLARE @dDateOfDiagnosisStart DATETIME
+DECLARE @dDateOfDiagnosisEnd DATETIME
+DECLARE @iMonthBefore INT
+DECLARE @iMonthAfter INT
+DECLARE @iAgeCritiria INT
+DECLARE @iBeneEnrollmtMinYear INT
+
+
+DROP TABLE IF EXISTS #ICDCodes 
+CREATE TABLE #ICDCodes (Code VARCHAR(4) PRIMARY KEY)
+
+
+DROP TABLE IF EXISTS #TempSEER 
+CREATE TABLE #TempSEER (patient_id VARCHAR(16),
+						primary_site CHAR(4), 
+						site_recode_icd_o_3_who_2008 VARCHAR(16),  
+						sequence_number INT, 
+						month_of_diagnosis_recode INT, 
+						year_of_diagnosis INT,  
+						date_of_diagnosis DATE,
+						year_of_birth INT, 
+						age_at_dx INT,
+						Combined_Summary_Stage_2004 VARCHAR(16), 
+						SEER_DateofDeath_Month INT, 
+						SEER_DateofDeath_Year INT,
+						date_of_death DATE
+);
+
+
+CREATE INDEX IDX_TempSEER ON #TempSEER (patient_id, date_of_diagnosis)
+
+
+DROP TABLE IF EXISTS #CohortAttrition
+CREATE TABLE #CohortAttrition (Step NVARCHAR(10),
+							Total INT);
+
+
+-- Update variables accordingly
+-------------------------------
+
+SET @dDateOfDiagnosisStart = '2010-01-01'
+SET @dDateOfDiagnosisEnd = '2019-06-30'
+SET @iMonthBefore = -12
+SET @iMonthAfter = 6
+SET @iAgeCritiria = 65
+SET @iBeneEnrollmtMinYear = 2009
+
+
+INSERT #ICDCodes (Code)
+SELECT Code
+FROM SEER.dbo.ICD_O_3_Code
+WHERE Cancer_Type = @nCancerType;
+
+
+SET @nSQL = N'
+INSERT INTO #TempSEER (patient_id,
+  					   primary_site, 
+					   site_recode_icd_o_3_who_2008,  
+					   sequence_number, 
+					   month_of_diagnosis_recode, 
+					   year_of_diagnosis,
+					   year_of_birth, 
+					   age_at_dx,
+					   Combined_Summary_Stage_2004, 
+					   SEER_DateofDeath_Month,
+					   SEER_DateofDeath_Year,
+					   date_of_diagnosis,
+					   date_of_death
+)
+SELECT patient_id,
+  	   primary_site, 
+	   site_recode_icd_o_3_who_2008,  
+	   sequence_number, 
+	   month_of_diagnosis_recode, 
+	   CAST(year_of_diagnosis AS INT),
+	   year_of_birth, 
+	   CAST(year_of_diagnosis AS INT) - CAST(year_of_birth AS INT) AS age_at_dx,
+	   Combined_Summary_Stage_2004, 
+	   NULLIF(SEER_DateofDeath_Month,'''') AS SEER_DateofDeath_Month,
+	   NULLIF(SEER_DateofDeath_Year,'''') AS SEER_DateofDeath_Year,
+	   DATEFROMPARTS(CAST(year_of_diagnosis AS INT), CAST(month_of_diagnosis_recode AS INT), CAST(1 AS INT)),
+	   DATEFROMPARTS(CAST(NULLIF(SEER_DateofDeath_Year,'''') AS INT), CAST(NULLIF(SEER_DateofDeath_Month,'''') AS INT), CAST(1 AS INT))
+FROM  ' + @nCancerTableName
+
+EXECUTE sp_executesql @nSQL
+
+
+--Step 1: Primary cancer diagnosis (ICD-O-3 codes), within diagnosis timeframe
+---------
+SELECT c.*
+INTO #Step1
+FROM #TempSEER c
+INNER JOIN #ICDCodes i
+	ON c.primary_site = i.Code
+WHERE	
+	DATEFROMPARTS(CAST(c.year_of_diagnosis AS INT), CAST(c.Month_of_diagnosis_recode AS INT), CAST(1 AS INT)) >= @dDateOfDiagnosisStart 
+    AND DATEFROMPARTS(CAST(c.year_of_diagnosis AS INT), CAST(c.Month_of_diagnosis_recode AS INT), CAST(1 AS INT)) <= @dDateOfDiagnosisEnd
+	ORDER BY date_of_diagnosis;
+
+
+/*
+SELECT c.*
+INTO #Step1
+FROM #TempSEER c
+INNER JOIN [SEER].[dbo].[ICD_O_3_Code] i
+	ON c.primary_site = i.Code
+WHERE	
+	Cancer_Type = @nCancerName
+	AND DATEFROMPARTS(CAST(c.year_of_diagnosis AS INT), CAST(c.Month_of_diagnosis_recode AS INT), CAST(1 AS INT)) >= @dDateOfDiagnosisStart 
+    AND DATEFROMPARTS(CAST(c.year_of_diagnosis AS INT), CAST(c.Month_of_diagnosis_recode AS INT), CAST(1 AS INT)) <= @dDateOfDiagnosisEnd
+	ORDER BY date_of_diagnosis;
+*/
+
+
+
+
+CREATE INDEX IDX_Step1 ON #Step1 (patient_id)
+
+
+INSERT INTO #CohortAttrition (Step, Total)
+SELECT 'Step 1', COUNT(DISTINCT(patient_id)) 
+FROM #Step1;
+----------------------
+
+
+-- Step 2
+---------
+-- Step 2.1: Transform continous enrollment wide format to long format and mark DISCONTINUOUS enrollment periods
+-- Merge with Medicare enrollment table
+SELECT s1.patient_id, 
+	s1.date_of_diagnosis,
+	DATEADD(MONTH, @iMonthBefore, s1.date_of_diagnosis) AS tp_prior_month, 
+	DATEADD(MONTH, @iMonthAfter, s1.date_of_diagnosis) AS tp_post_month,
+	mbsf.BENE_ENROLLMT_REF_YR,
+	mbsf.MDCR_STATUS_CODE_01, 
+	mbsf.MDCR_STATUS_CODE_02, 
+	mbsf.MDCR_STATUS_CODE_03, 
+	mbsf.MDCR_STATUS_CODE_04, 
+	mbsf.MDCR_STATUS_CODE_05,
+	mbsf.MDCR_STATUS_CODE_06, 
+	mbsf.MDCR_STATUS_CODE_07, 
+	mbsf.MDCR_STATUS_CODE_08, 
+	mbsf.MDCR_STATUS_CODE_09, 
+	mbsf.MDCR_STATUS_CODE_10, 
+	mbsf.MDCR_STATUS_CODE_11, 
+	mbsf.MDCR_STATUS_CODE_12
+INTO #temp_mdcr
+FROM #Step1 s1
+LEFT JOIN SEER.dbo.mbsfabcd mbsf 
+	ON s1.patient_id = mbsf.patient_id;
+
+
+
+SELECT patient_id, 
+	date_of_diagnosis, 
+	tp_prior_month, 
+	tp_post_month,
+	BENE_ENROLLMT_REF_YR, 
+	mdcr_status_code, 
+	RIGHT(mdcr_status_code, 2) AS mdcr_month, 
+	mdcr_status, 
+	CASE WHEN mdcr_status = '00' 
+		THEN 'not enrolled' 
+		ELSE 'enrolled' 
+	END AS mdcr_status_2grp,
+	DATEFROMPARTS(CAST(BENE_ENROLLMT_REF_YR AS INT), CAST(RIGHT(mdcr_status_code, 2) AS INT), CAST(1 AS INT)) AS date_of_enrollmt
+INTO #temp_mdcr_enrl_long 
+FROM #temp_mdcr 
+UNPIVOT(mdcr_status FOR mdcr_status_code IN (MDCR_STATUS_CODE_01, MDCR_STATUS_CODE_02, MDCR_STATUS_CODE_03, 
+											MDCR_STATUS_CODE_04, MDCR_STATUS_CODE_05, MDCR_STATUS_CODE_06, 
+											MDCR_STATUS_CODE_07, MDCR_STATUS_CODE_08, MDCR_STATUS_CODE_09, 
+											MDCR_STATUS_CODE_10, MDCR_STATUS_CODE_11, MDCR_STATUS_CODE_12)) AS temp_enrl_long 
+WHERE BENE_ENROLLMT_REF_YR >= @iBeneEnrollmtMinYear;
+
+
+
+-- Exclude patients with discontinuous enrollment within 12 months prior to diagnosis date
+SELECT * 
+INTO #Step2_rm_mdcr_enrl 
+FROM #temp_mdcr_enrl_long
+WHERE mdcr_status_2grp = 'not enrolled' AND (date_of_enrollmt >= tp_prior_month AND date_of_enrollmt <= date_of_diagnosis);
+
+
+CREATE INDEX IDX_Step2_rm_mdcr_enrl ON #Step2_rm_mdcr_enrl (patient_id)
+
+
+SELECT s1.*
+INTO #Step2_1
+FROM #Step1 s1
+LEFT JOIN #Step2_rm_mdcr_enrl s2_mdcr_rm
+	ON s1.patient_id = s2_mdcr_rm.patient_id
+WHERE s2_mdcr_rm.patient_id IS NULL;
+
+
+CREATE INDEX IDX_Step2_1 ON #Step2_1 (patient_id)
+
+
+-- Step 2.2: no enrollment in an HMO for a minimum 12 months prior to date_dx and no enrollment 6 months after
+-- Merge with HMO enrollment table
+SELECT s1.patient_id, 
+	s1.date_of_diagnosis,
+	DATEADD(MONTH, @iMonthBefore, s1.date_of_diagnosis) AS tp_prior_month, 
+	DATEADD(MONTH, @iMonthAfter, s1.date_of_diagnosis) AS tp_post_month,
+	mbsf.BENE_ENROLLMT_REF_YR,
+	mbsf.HMO_IND_01, 
+	mbsf.HMO_IND_02, 
+	mbsf.HMO_IND_03, 
+	mbsf.HMO_IND_04, 
+	mbsf.HMO_IND_05, 
+	mbsf.HMO_IND_06, 
+	mbsf.HMO_IND_07, 
+	mbsf.HMO_IND_08, 
+	mbsf.HMO_IND_09, 
+	mbsf.HMO_IND_10, 
+	mbsf.HMO_IND_11, 
+	mbsf.HMO_IND_12
+INTO #temp_hmo
+FROM #Step1 s1
+LEFT JOIN SEER.dbo.mbsfabcd mbsf 
+	ON s1.patient_id = mbsf.patient_id;
+
+
+SELECT patient_id, 
+	date_of_diagnosis, 
+	tp_prior_month, 
+	tp_post_month,
+	BENE_ENROLLMT_REF_YR, 
+	hmo_ind_code, 
+	RIGHT(hmo_ind_code, 2) AS hmo_month, 
+	hmo_status, 
+	CASE WHEN hmo_status Like '0%' 
+	THEN 'not enrolled' 
+	ELSE 'enrolled' 
+	END AS hmo_status_2grp,
+	DATEFROMPARTS(CAST(BENE_ENROLLMT_REF_YR AS INT), CAST(RIGHT(hmo_ind_code, 2) AS INT), CAST(1 AS INT)) AS date_of_hmo
+INTO #temp_hmo_enrl_long 
+FROM #temp_hmo
+UNPIVOT(hmo_status FOR hmo_ind_code IN (HMO_IND_01, HMO_IND_02, HMO_IND_03, 
+										HMO_IND_04, HMO_IND_05, HMO_IND_06, 
+										HMO_IND_07, HMO_IND_08, HMO_IND_09, 
+										HMO_IND_10, HMO_IND_11, HMO_IND_12)) AS temp_enrl_hmo
+WHERE BENE_ENROLLMT_REF_YR >= @iBeneEnrollmtMinYear;
+
+
+-- Exclude patients with hmo within 12 months prior to diagnosis date
+SELECT * 
+INTO #Step2_rm_hmo_enrl
+FROM #temp_hmo_enrl_long
+WHERE hmo_status_2grp = 'enrolled' AND (date_of_hmo >= tp_prior_month AND date_of_hmo <= tp_post_month);
+
+
+CREATE INDEX IDX_Step2_rm_hmo_enrl ON #Step2_rm_hmo_enrl (patient_id)
+
+
+SELECT s1.*
+INTO #Step2_2
+FROM #Step1 s1
+LEFT JOIN #Step2_rm_hmo_enrl s2_hmo_rm
+	ON s1.patient_id = s2_hmo_rm.patient_id
+WHERE s2_hmo_rm.patient_id IS NULL;
+
+
+CREATE INDEX IDX_Step2_2 ON #Step2_2 (patient_id)
+
+
+SELECT s2_1.*
+INTO #Step2_3
+FROM #Step2_1 s2_1
+INNER JOIN #Step2_2 s2_2 
+	ON s2_1.patient_id = s2_2.patient_id;
+
+
+CREATE INDEX IDX_Step2_3 ON #Step2_3 (patient_id)
+
+
+SELECT s2_3.*
+INTO #Step2_final
+FROM #Step2_3 s2_3
+LEFT JOIN SEER.dbo.mbsfabcd mbsf
+	ON s2_3.patient_id = mbsf.patient_id
+WHERE (mbsf.BENE_ENROLLMT_REF_YR<>'') AND (mbsf.BENE_ENROLLMT_REF_YR IS NOT NULL);
+
+
+CREATE INDEX IDX_Step2_final ON #Step2_final (patient_id)
+
+
+INSERT INTO #CohortAttrition (Step, Total)
+SELECT 'Step 2', COUNT(DISTINCT(patient_id))
+FROM #Step2_final;
+-------------------------------------------------------------
+
+
+-- Step 3: Patient had no prior cancer diagnosis from a different site, excluding non-melanoma skin cancers
+---------
+
+SELECT s2.patient_id, tp.date_of_diagnosis
+INTO #Step3
+FROM #Step2_final s2
+LEFT JOIN #Step1 tp
+	ON s2.patient_id = tp.patient_id
+		AND s2.date_of_diagnosis = tp.date_of_diagnosis
+WHERE tp.sequence_number = 0
+	OR tp.sequence_number = 1;
+
+
+CREATE INDEX IDX_Step3 ON #Step3 (patient_id)
+
+
+INSERT INTO #CohortAttrition (Step, Total)
+SELECT 'Step 3', COUNT(DISTINCT(patient_id)) 
+FROM #Step3;
+-------------------------------------------------------------
+
+
+-- Step 4: Patient is age 65 or over at time of diagnosis
+---------
+SELECT s3.patient_id, s3.date_of_diagnosis, tp.age_at_dx 
+INTO #Step4
+FROM #Step3 s3
+LEFT JOIN #TempSEER tp
+	ON s3.patient_id = tp.patient_id 
+		AND s3.date_of_diagnosis = tp.date_of_diagnosis
+WHERE age_at_dx >= @iAgeCritiria;
+
+
+CREATE INDEX IDX_Step4 ON #Step4 (patient_id)
+
+
+INSERT INTO #CohortAttrition (Step, Total)
+SELECT 'Step 4', COUNT(DISTINCT(patient_id)) 
+FROM #Step4;
+-------------------------------------------------------------
+
+
+-- Step 5: Patient has no missing data for date of cancer diagnosis or cancer staging
+---------
+SELECT s4.patient_id, s4.date_of_diagnosis, tp.age_at_dx, tp.Combined_Summary_Stage_2004 
+INTO #Step5
+FROM #Step4 s4
+LEFT JOIN #TempSEER tp 
+	ON s4.patient_id = tp.patient_id 
+		AND s4.date_of_diagnosis = tp.date_of_diagnosis
+WHERE s4.date_of_diagnosis IS NOT NULL 
+	OR s4.date_of_diagnosis <> '' 
+	OR tp.Combined_Summary_Stage_2004 IS NOT NULL 
+	OR tp.Combined_Summary_Stage_2004 <> '';
+
+
+CREATE INDEX IDX_Step5 ON #Step5 (patient_id)
+
+
+INSERT INTO #CohortAttrition (Step, Total)
+SELECT 'Step 5', COUNT(DISTINCT(patient_id)) 
+FROM #Step5;
+-------------------------------------------------------------
+
+
+-- Step 6: Patient's cancer diagnosis did not occur after their date of death
+---------
+SELECT s5.patient_id, s5.date_of_diagnosis, tp.date_of_death 
+INTO #Step6
+FROM #Step5 s5
+LEFT JOIN #TempSEER tp
+	ON s5.patient_id = tp.patient_id 
+		AND s5.date_of_diagnosis = tp.date_of_diagnosis
+WHERE s5.date_of_diagnosis <= tp.date_of_death 
+	OR tp.date_of_death IS NULL;
+
+
+CREATE INDEX IDX_Step6 ON #Step6 (patient_id)
+
+
+INSERT INTO #CohortAttrition (Step, Total)
+SELECT 'Step 6', COUNT(DISTINCT(patient_id)) 
+FROM #Step6;
+-------------------------------------------------------------
+
+-- Compile attrition table
+INSERT INTO SEER.dbo.SEER_Attrition (CancerType, Step, Total)
+SELECT @nCancerType, Step, Total
+FROM #CohortAttrition
+ORDER BY Step;
+-------------------------------------------------------------
+
+
+-- Pick up patient cohort id and cancer type
+INSERT INTO SEER.dbo.SEER_PatientCohort (PatientId, CancerType, date_of_diagnosis)
+SELECT DISTINCT(patient_id), @nCancerType, date_of_diagnosis
+FROM #Step6
+ORDER BY patient_id;
+
