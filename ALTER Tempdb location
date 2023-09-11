@@ -1,0 +1,27 @@
+--STEP1
+--Determine the logical file names of the tempdb and their current location on the disk
+
+SELECT FILE_ID, name, physical_name
+FROM tempdb.sys.database_files
+
+--or
+SELECT name, physical_name AS CurrentLocation, state_desc
+FROM sys.master_files
+WHERE database_id = DB_ID('tempdb')
+
+
+--C:\Program Files\Microsoft SQL Server\MSSQL16.CURTAESSQLSERVER\MSSQL\DATA\tempdb.mdf
+--C:\Program Files\Microsoft SQL Server\MSSQL16.CURTAESSQLSERVER\MSSQL\DATA\templog.ldf
+
+--STEP2
+--Change the location of each file by using ALTER DATABASE statement
+USE master;
+GO
+
+ALTER DATABASE tempdb
+MODIFY FILE (NAME = tempdev, FILENAME = 'E:\Microsoft SQL Server\MSSQL16.CURTAESSQLSERVER\MSSQL\DATA\tempdbdev.mdf');
+GO
+
+ALTER DATABASE tempdb
+MODIFY FILE (NAME = templog, FILENAME = 'E:\Microsoft SQL Server\MSSQL16.CURTAESSQLSERVER\MSSQL\DATA\tempdblog.ldf');
+GO
